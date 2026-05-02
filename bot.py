@@ -65,6 +65,16 @@ REJECT_PATTERNS = [
     r"(remove me|unsubscribe|do not contact|stop messaging|block|spam)",
 ]
 
+WAIT_PATTERNS = [
+    r"\b(check|checking|confirm|confirming|verify|verifying)\b",
+    r"(let me (ask|check|confirm|find out|look into))",
+    r"(give me (a (moment|minute|sec|second)|some time))",
+    r"(will (get back|update|let you know|revert|reply|check))",
+    r"(ek baar (dekh|check|puch|pooch))",
+    r"(thoda time|dekhta hoon|dekhti hoon|pooch ke batata|pooch ke batati)",
+    r"\b(busy|call back|call later|later|baad mein baat)\b",
+]
+
 
 def is_auto_reply(msg: str) -> bool:
     m = msg.lower()
@@ -81,6 +91,10 @@ def is_acceptance(msg: str) -> bool:
 def is_rejection(msg: str) -> bool:
     m = msg.lower()
     return any(re.search(p, m) for p in REJECT_PATTERNS)
+
+def is_wait(msg: str) -> bool:
+    m = msg.lower()
+    return any(re.search(p, m) for p in WAIT_PATTERNS)
 
 
 # ─── Context helpers ─────────────────────────────────────────────────────────
@@ -138,10 +152,7 @@ SYSTEM_PROMPT = """You are Vera, magicpin's merchant AI assistant that talks to 
 CORE RULES — NEVER BREAK:
 1. Open with the WHY (the specific trigger). No "I hope you're doing well." No "Hi, Vera here." If conversation_history exists, open with a callback to the last topic discussed (e.g., "Last time we talked about your stale posts — here's the follow-up.").
 2. Anchor on ONE verifiable fact from the context: a number, date, source, headline, or peer stat. Generic phrases ("grow your business", "boost your sales", "10% off") are penalized.
-3. Use exactly ONE compulsion lever:
-   • Specificity/verifiability  • Loss aversion ("you're missing X")  • Social proof ("3 dentists in your locality…")
-   • Effort externalization ("I've drafted it — just say go")  • Curiosity ("want to see?")
-   • Asking the merchant ("what's your most-asked treatment this week?")  • Single binary commitment
+3. Use the lever specified in COMPULSION LEVER — do not substitute a different one. Apply it with full force.
 4. CTA rules:
    - binary_yes_stop: last sentence must be "Reply YES to [action] or STOP to opt out."
    - open_ended: end with a single open question
@@ -229,6 +240,64 @@ DIGEST ITEM (reference this specifically):
 
     owner_name = identity.get("owner_first_name", identity.get("name", ""))
 
+    # Pre-compute strongest available KEY_FACT so Claude can't go generic
+    views = perf.get("views", 0)
+    calls = perf.get("calls", 0)
+    ctr   = perf.get("ctr", 0)
+    lapsed = cust_agg.get("lapsed_180d_plus", 0)
+    retention = cust_agg.get("retention_6mo_pct", 0)
+    days_left = merchant.get("subscription", {}).get("days_remaining", "")
+    delta_views = perf.get("delta_7d", {}).get("views_pct", 0)
+    delta_calls = perf.get("delta_7d", {}).get("calls_pct", 0)
+
+    if trg_kind == "perf_dip" and ctr > 0:
+        key_fact = f"CTR is {ctr:.3f} vs peer avg {peer.get('avg_ctr', 0):.3f} — {ctr_status}"
+    elif trg_kind == "renewal_due" and days_left:
+        key_fact = f"Subscription expires in {days_left} days"
+    elif trg_kind == "dormant_with_vera" and lapsed:
+        key_fact = f"{lapsed} customers haven't visited in 180+ days"
+    elif trg_kind in ("perf_spike", "milestone_reached") and (delta_views or delta_calls):
+        key_fact = f"Views {delta_views*100:+.0f}%, calls {delta_calls*100:+.0f}% this week"
+    elif views > 0:
+        key_fact = f"{views} views and {calls} calls in last 30 days"
+    elif trg_payload:
+        key_fact = json.dumps(trg_payload, ensure_ascii=False)[:120]
+    else:
+        key_fact = f"Trigger: {trg_kind}"
+
+    # Best compulsion lever per trigger kind
+    LEVER_MAP = {
+        "perf_dip":               "loss_aversion",
+        "perf_spike":             "specificity",
+        "dormant_with_vera":      "social_proof",
+        "competitor_opened":      "loss_aversion",
+        "festival_upcoming":      "social_proof",
+        "renewal_due":            "loss_aversion",
+        "recall_due":             "loss_aversion",
+        "review_theme_emerged":   "specificity",
+        "research_digest":        "curiosity",
+        "regulation_change":      "loss_aversion",
+        "milestone_reached":      "specificity",
+        "curious_ask_due":        "asking_merchant",
+        "category_trend_movement":"curiosity",
+        "stale_profile":          "effort_externalization",
+        "weather_heatwave":       "curiosity",
+        "local_news_event":       "curiosity",
+        "appointment_tomorrow":   "effort_externalization",
+        "customer_lapsed_soft":   "social_proof",
+        "wedding_package_followup":"effort_externalization",
+        "scheduled_recurring":    "asking_merchant",
+    }
+    lever = LEVER_MAP.get(trg_kind, "specificity")
+    LEVER_DESCRIPTIONS = {
+        "loss_aversion":          "Frame what the merchant is losing right now (revenue, customers, rank).",
+        "social_proof":           "Name how many peers in their locality are already doing this.",
+        "specificity":            "Lead with the exact number or named fact from KEY_FACT.",
+        "curiosity":              "End with an intriguing open question that makes them want to know more.",
+        "effort_externalization": "Tell them you've already done the work — they just need to say go.",
+        "asking_merchant":        "Ask a single specific question about their business to open dialogue.",
+    }
+
     # Category-specific compliance rules
     CATEGORY_RULES = {
         "dentists": "No clinical outcome claims. Never say 'cure', 'heal', 'treat', 'pain-free', 'safe procedure'. Stick to patient volume and booking angles.",
@@ -299,6 +368,8 @@ DIGEST ITEM (reference this specifically):
         digest_section,
         cust_section,
         social_proof_section,
+        f"KEY_FACT (you MUST reference this in the message): {key_fact}",
+        f"COMPULSION LEVER (use this and only this): {lever} — {LEVER_DESCRIPTIONS[lever]}",
         f"CTA required: {cta_instruction}",
         f'suppression_key in JSON must be: "{sup_key}"',
     ]
@@ -414,6 +485,13 @@ def handle_reply(conv_id: str, merchant_msg: str, merchant_id: str, customer_id:
             "body": body,
             "cta": "open_ended",
             "rationale": "Merchant accepted; executing promised step immediately without re-qualifying.",
+        }
+
+    # Wait fast path — merchant is checking / busy; pause, don't push
+    if is_wait(merchant_msg):
+        return {
+            "action": "wait",
+            "rationale": "Merchant is checking or stepping away; waiting without follow-up pressure.",
         }
 
     # Build context for LLM
