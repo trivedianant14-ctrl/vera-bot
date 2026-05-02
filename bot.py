@@ -150,6 +150,7 @@ CORE RULES — NEVER BREAK:
 6. Never hallucinate data. If a fact isn't in the context, don't say it.
 7. Taboo words (never use): guaranteed, 100% safe, completely cure, miracle, best in city, doctor approved.
 8. Hindi-English code-mix ONLY if merchant language includes "hi". Pure English otherwise.
+9. Address the merchant owner by first name in the opening (provided as OWNER_NAME in context). Warm but brief — e.g. "Rahul, your CTR dropped..." not "Dear Rahul,".
 
 Output ONLY valid JSON — no surrounding text:
 {
@@ -226,6 +227,25 @@ DIGEST ITEM (reference this specifically):
 
     cta_instruction = CTA_MAP.get(trg_kind, "open_ended")
 
+    owner_name = identity.get("owner_first_name", identity.get("name", ""))
+
+    # Category-specific compliance rules
+    CATEGORY_RULES = {
+        "dentists": "No clinical outcome claims. Never say 'cure', 'heal', 'treat', 'pain-free', 'safe procedure'. Stick to patient volume and booking angles.",
+        "doctors": "No diagnosis or treatment promises. No outcome guarantees. Focus on availability, specialisation, and appointment booking only.",
+        "salons": "No claims about hair/skin 'transformation' or 'permanent' results. Seasonal and trend angles are fine.",
+        "spas": "No medical or therapeutic claims. Relaxation and experience framing only.",
+        "gyms": "No weight-loss guarantees. Focus on membership, classes, and community.",
+        "restaurants": "No health claims. Focus on cuisine, offers, footfall, and reviews.",
+        "cafes": "No health claims. Focus on menu, ambience, footfall, and offers.",
+    }
+    cat_slug_key = category.get("slug", "").lower()
+    category_rules = ""
+    for key, rule in CATEGORY_RULES.items():
+        if key in cat_slug_key:
+            category_rules = f"\nCATEGORY COMPLIANCE ({key}): {rule}\n"
+            break
+
     # Social proof for high-impact triggers
     social_proof_section = ""
     SOCIAL_PROOF_TRIGGERS = {"perf_dip", "dormant_with_vera", "competitor_opened", "festival_upcoming"}
@@ -256,8 +276,10 @@ DIGEST ITEM (reference this specifically):
 
     lines = [
         f"CATEGORY: {category.get('slug', '')} | Tone: {voice.get('tone', 'professional')} | {lang_note}",
+        category_rules,
         f"",
         f"MERCHANT: {identity.get('name', '')} ({identity.get('locality', '')}, {identity.get('city', '')})",
+        f"  OWNER_NAME: {owner_name}",
         f"  Subscription: {merchant.get('subscription', {}).get('status', '')} | Plan: {merchant.get('subscription', {}).get('plan', '')} | Days left: {merchant.get('subscription', {}).get('days_remaining', '')}",
         f"  Perf 30d: views={perf.get('views', 0)}, calls={perf.get('calls', 0)}, CTR={perf.get('ctr', 0):.3f} ({ctr_status}, peer avg={peer.get('avg_ctr', 0.03):.3f})",
         f"  7d delta: views {perf.get('delta_7d', {}).get('views_pct', 0)*100:+.0f}%, calls {perf.get('delta_7d', {}).get('calls_pct', 0)*100:+.0f}%",
