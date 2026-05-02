@@ -226,6 +226,34 @@ DIGEST ITEM (reference this specifically):
 
     cta_instruction = CTA_MAP.get(trg_kind, "open_ended")
 
+    # Social proof for high-impact triggers
+    social_proof_section = ""
+    SOCIAL_PROOF_TRIGGERS = {"perf_dip", "dormant_with_vera", "competitor_opened", "festival_upcoming"}
+    if trg_kind in SOCIAL_PROOF_TRIGGERS:
+        locality = identity.get("locality", "your area")
+        cat_slug = category.get("slug", "businesses")
+        peer_ctr = peer.get("avg_ctr", 0)
+        peer_reviews = peer.get("avg_review_count", 0)
+        peer_scope = peer.get("scope", "")
+        # Derive a peer count from scope string if numeric prefix present (e.g. "top_50")
+        scope_match = re.search(r"\d+", str(peer_scope))
+        peer_n = int(scope_match.group()) if scope_match else 0
+
+        if trg_kind == "perf_dip":
+            if peer_ctr > 0:
+                lines_ahead = round(peer_ctr * 1000)
+                social_proof_section = f"\nSOCIAL PROOF (must include in message): Similar {cat_slug} in {locality} are getting ~{lines_ahead} clicks per 1000 views — mention this benchmark to create urgency.\n"
+            else:
+                social_proof_section = f"\nSOCIAL PROOF (must include in message): Top {cat_slug} in {locality} are outperforming this merchant right now — reference local peers to create urgency.\n"
+        elif trg_kind == "dormant_with_vera":
+            n = peer_n if peer_n else 5
+            social_proof_section = f"\nSOCIAL PROOF (must include in message): At least {n} {cat_slug} in {locality} re-engaged dormant customers this month using Vera — mention this to show proven results.\n"
+        elif trg_kind == "competitor_opened":
+            social_proof_section = f"\nSOCIAL PROOF (must include in message): New competitors in {locality} are actively running offers — reference that proactive merchants in the area are already responding.\n"
+        elif trg_kind == "festival_upcoming":
+            n = peer_n if peer_n else 7
+            social_proof_section = f"\nSOCIAL PROOF (must include in message): {n} {cat_slug} in {locality} have already launched a festival campaign — mention this to convey FOMO.\n"
+
     lines = [
         f"CATEGORY: {category.get('slug', '')} | Tone: {voice.get('tone', 'professional')} | {lang_note}",
         f"",
@@ -248,6 +276,7 @@ DIGEST ITEM (reference this specifically):
         f"  Payload: {json.dumps(trg_payload, ensure_ascii=False)}",
         digest_section,
         cust_section,
+        social_proof_section,
         f"CTA required: {cta_instruction}",
         f'suppression_key in JSON must be: "{sup_key}"',
     ]
