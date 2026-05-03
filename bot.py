@@ -60,7 +60,7 @@ ACCEPT_PATTERNS = [
 ]
 
 REJECT_PATTERNS = [
-    r"\b(no|nahi|na|nope|nah|never|mat|band karo)\b",
+    r"\b(stop|no|nahi|na|nope|nah|never|mat|band karo)\b",
     r"(not interested|abhi nahi|baad mein|don'?t (want|need|contact|call))",
     r"(remove me|unsubscribe|do not contact|stop messaging|block|spam)",
 ]
@@ -108,22 +108,27 @@ CTA_MAP = {
     "research_digest":           "open_ended",
     "regulation_change":         "binary_yes_stop",
     "perf_dip":                  "binary_yes_stop",
+    "seasonal_perf_dip":         "binary_yes_stop",
     "perf_spike":                "open_ended",
     "recall_due":                "binary_yes_stop",
     "renewal_due":               "binary_yes_stop",
     "dormant_with_vera":         "binary_yes_stop",
     "festival_upcoming":         "binary_yes_stop",
+    "ipl_match_today":           "binary_yes_stop",
+    "local_news_event":          "open_ended",
     "milestone_reached":         "open_ended",
     "competitor_opened":         "binary_yes_stop",
     "curious_ask_due":           "none",
     "category_trend_movement":   "open_ended",
     "review_theme_emerged":      "binary_yes_stop",
     "wedding_package_followup":  "binary_yes_stop",
+    "winback_eligible":          "binary_yes_stop",
+    "customer_lapsed_soft":      "binary_yes_stop",
+    "customer_lapsed_hard":      "binary_yes_stop",
     "weather_heatwave":          "open_ended",
-    "local_news_event":          "open_ended",
+    "active_planning_intent":    "binary_yes_stop",
     "scheduled_recurring":       "open_ended",
     "appointment_tomorrow":      "binary_yes_stop",
-    "customer_lapsed_soft":      "binary_yes_stop",
     "stale_profile":             "binary_yes_stop",
 }
 
@@ -131,18 +136,27 @@ TEMPLATE_MAP = {
     "research_digest":          "vera_research_digest_v1",
     "regulation_change":        "vera_compliance_alert_v1",
     "perf_dip":                 "vera_perf_dip_v1",
+    "seasonal_perf_dip":        "vera_seasonal_dip_v1",
     "perf_spike":               "vera_perf_spike_v1",
     "recall_due":               "vera_recall_reminder_v1",
     "renewal_due":              "vera_renewal_due_v1",
     "dormant_with_vera":        "vera_re_engage_v1",
     "festival_upcoming":        "vera_festival_campaign_v1",
+    "ipl_match_today":          "vera_ipl_match_v1",
+    "local_news_event":         "vera_local_news_v1",
     "milestone_reached":        "vera_milestone_v1",
     "competitor_opened":        "vera_competitor_alert_v1",
     "curious_ask_due":          "vera_curious_ask_v1",
     "category_trend_movement":  "vera_trend_alert_v1",
     "review_theme_emerged":     "vera_review_theme_v1",
     "wedding_package_followup": "vera_bridal_followup_v1",
+    "winback_eligible":         "vera_winback_v1",
+    "customer_lapsed_soft":     "vera_lapsed_soft_v1",
+    "customer_lapsed_hard":     "vera_lapsed_hard_v1",
     "weather_heatwave":         "vera_weather_nudge_v1",
+    "active_planning_intent":   "vera_planning_intent_v1",
+    "appointment_tomorrow":     "vera_appointment_reminder_v1",
+    "stale_profile":            "vera_stale_profile_v1",
 }
 
 
@@ -268,10 +282,12 @@ DIGEST ITEM (reference this specifically):
     # Best compulsion lever per trigger kind
     LEVER_MAP = {
         "perf_dip":               "loss_aversion",
+        "seasonal_perf_dip":      "loss_aversion",
         "perf_spike":             "specificity",
         "dormant_with_vera":      "social_proof",
         "competitor_opened":      "loss_aversion",
         "festival_upcoming":      "social_proof",
+        "ipl_match_today":        "social_proof",
         "renewal_due":            "loss_aversion",
         "recall_due":             "loss_aversion",
         "review_theme_emerged":   "specificity",
@@ -284,7 +300,10 @@ DIGEST ITEM (reference this specifically):
         "weather_heatwave":       "curiosity",
         "local_news_event":       "curiosity",
         "appointment_tomorrow":   "effort_externalization",
-        "customer_lapsed_soft":   "social_proof",
+        "customer_lapsed_soft":   "loss_aversion",
+        "customer_lapsed_hard":   "loss_aversion",
+        "winback_eligible":       "loss_aversion",
+        "active_planning_intent": "effort_externalization",
         "wedding_package_followup":"effort_externalization",
         "scheduled_recurring":    "asking_merchant",
     }
@@ -409,6 +428,90 @@ def compose_message(category: dict, merchant: dict, trigger: dict, customer: Opt
             "send_as": "vera",
             "suppression_key": sup,
             "rationale": "Fallback — JSON parse error in compose",
+        }
+
+
+# ─── Customer reply handler ──────────────────────────────────────────────────
+CUSTOMER_REPLY_SYSTEM = """You are acting as a customer-service AI on behalf of a merchant (not Vera the business assistant). The merchant's customer has sent a message and you must reply as the merchant's proxy, directly to that customer.
+
+RULES:
+1. Always address the customer by name if known.
+2. Booking confirmation request (slot, appointment, date, time) → confirm the booking clearly with date + time, tell them what to expect next.
+3. Question about the business → answer using the context provided (offers, hours, services). Don't invent details.
+4. Cancellation or refusal → acknowledge gracefully, offer an alternative if possible.
+5. Max 2 sentences. WhatsApp-native. Warm, human tone. No markdown.
+
+Output ONLY valid JSON:
+{
+  "action": "send|end",
+  "body": "text (always include for action=send)",
+  "cta": "none",
+  "rationale": "one sentence"
+}"""
+
+
+def handle_customer_reply(conv_id: str, customer_msg: str, merchant_id: str, customer_id: Optional[str], turn_num: int) -> dict:
+    conv     = conversations.get(conv_id, {})
+    turns    = conv.get("turns", [])
+    merchant = get_ctx("merchant", merchant_id) or {}
+    customer = get_ctx("customer", customer_id) if customer_id else None
+    identity = merchant.get("identity", {})
+    cat_slug = merchant.get("category_slug", "")
+    active_offers = [o["title"] for o in merchant.get("offers", []) if o.get("status") == "active"]
+
+    cust_name = ""
+    if customer:
+        cust_name = customer.get("identity", {}).get("name", "")
+
+    # Resolve slots from the trigger payload if available
+    trg_id    = conv.get("trigger_id", "")
+    trg       = get_ctx("trigger", trg_id) if trg_id else None
+    slots_txt = ""
+    if trg:
+        slots = trg.get("payload", {}).get("available_slots", [])
+        if slots:
+            slots_txt = " | ".join(s.get("label", "") for s in slots[:3])
+
+    history_txt = "\n".join(f"  {t['from'].upper()}: {t['body']}" for t in turns[-4:])
+
+    user_msg = f"""MERCHANT: {identity.get('name', '')} ({cat_slug}, {identity.get('locality', '')})
+CUSTOMER: {cust_name or 'unknown'} (customer_id: {customer_id or 'none'})
+ACTIVE OFFERS: {', '.join(active_offers) or 'none'}
+AVAILABLE SLOTS: {slots_txt or 'check with clinic'}
+
+CONVERSATION SO FAR:
+{history_txt}
+
+CUSTOMER'S MESSAGE (turn {turn_num}): "{customer_msg}"
+
+Reply directly to the customer as the merchant's assistant. If they're confirming a booking slot, confirm it."""
+
+    try:
+        resp = client.messages.create(
+            model=MODEL,
+            max_tokens=200,
+            temperature=0,
+            system=CUSTOMER_REPLY_SYSTEM,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        raw = resp.content[0].text.strip()
+        if "```" in raw:
+            for part in raw.split("```"):
+                part = part.lstrip("json").strip()
+                if part.startswith("{"):
+                    raw = part
+                    break
+        result = json.loads(raw)
+        if result.get("action") != "send":
+            result.pop("body", None)
+        return result
+    except Exception:
+        confirm_body = f"Thank you{', ' + cust_name if cust_name else ''}! We've noted your request and will confirm shortly."
+        return {
+            "action": "send",
+            "body": confirm_body,
+            "cta": "none",
+            "rationale": "Fallback customer reply",
         }
 
 
@@ -663,7 +766,16 @@ async def tick(body: TickBody):
         try:
             composed = compose_message(category, merchant, trg, customer)
         except Exception:
-            continue
+            owner = merchant.get("identity", {}).get("owner_first_name",
+                    merchant.get("identity", {}).get("name", ""))
+            cta_fallback = CTA_MAP.get(trg.get("kind", ""), "open_ended")
+            composed = {
+                "body": f"{owner}, quick update on your magicpin account. Reply YES to learn more or STOP to opt out." if cta_fallback == "binary_yes_stop" else f"{owner}, something came up on your magicpin account worth a quick look.",
+                "cta": cta_fallback,
+                "send_as": "vera",
+                "suppression_key": sup_key,
+                "rationale": "Fallback — compose exception",
+            }
 
         body_text = composed.get("body", "").strip()
         if not body_text:
@@ -721,13 +833,25 @@ async def reply_endpoint(body: ReplyBody):
 
     conv["turns"].append({"from": body.from_role, "body": body.message, "ts": body.received_at})
 
-    result = handle_reply(
-        body.conversation_id,
-        body.message,
-        body.merchant_id or conv.get("merchant_id", ""),
-        body.customer_id or conv.get("customer_id"),
-        body.turn_number,
-    )
+    mid = body.merchant_id or conv.get("merchant_id", "")
+    cid = body.customer_id or conv.get("customer_id")
+
+    if body.from_role == "customer":
+        result = handle_customer_reply(
+            body.conversation_id,
+            body.message,
+            mid,
+            cid,
+            body.turn_number,
+        )
+    else:
+        result = handle_reply(
+            body.conversation_id,
+            body.message,
+            mid,
+            cid,
+            body.turn_number,
+        )
 
     if result.get("action") == "send" and result.get("body"):
         conv["turns"].append({"from": "vera", "body": result["body"], "ts": datetime.now(timezone.utc).isoformat()})
