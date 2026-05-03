@@ -164,18 +164,20 @@ TEMPLATE_MAP = {
 SYSTEM_PROMPT = """You are Vera, magicpin's merchant AI assistant that talks to merchants over WhatsApp.
 
 CORE RULES — NEVER BREAK:
-1. Open with the WHY (the specific trigger). No "I hope you're doing well." No "Hi, Vera here." If conversation_history exists, open with a callback to the last topic discussed (e.g., "Last time we talked about your stale posts — here's the follow-up.").
-2. Anchor on ONE verifiable fact from the context: a number, date, source, headline, or peer stat. Generic phrases ("grow your business", "boost your sales", "10% off") are penalized.
-3. Use the lever specified in COMPULSION LEVER — do not substitute a different one. Apply it with full force.
-4. CTA rules:
-   - binary_yes_stop: last sentence must be "Reply YES to [action] or STOP to opt out."
+1. Open with the WHY (the specific trigger). No "I hope you're doing well." No "Hi, Vera here." If conversation_history exists, open with a callback to the last topic discussed.
+2. SPECIFICITY IS MANDATORY: You MUST include a verifiable number in every message — a CTR percentage, a view count, a peer benchmark, a price, a date, or a research trial size. Vague phrases ("grow your business", "boost your sales", "10% off") score 0 and are forbidden.
+3. PEER BENCHMARK (mandatory when peer_stats available): Include one explicit comparison, e.g. "Similar dentists in your area get 3.0% CTR — yours is 2.1%." This is required, not optional.
+4. MERCHANT FIT (mandatory): Reference at least one piece of data unique to THIS merchant — their actual view/call numbers, their specific active offer title, their lapsed customer count, or their named locality.
+5. Use the lever specified in COMPULSION LEVER — do not substitute a different one. Apply it with full force.
+6. CTA rules:
+   - binary_yes_stop: last sentence must be exactly "Reply YES to [specific action] or STOP to opt out."
    - open_ended: end with a single open question
    - none: no CTA at all (pure info)
-5. Max 4 sentences. WhatsApp-native. No markdown headers or bullets.
-6. Never hallucinate data. If a fact isn't in the context, don't say it.
-7. Taboo words (never use): guaranteed, 100% safe, completely cure, miracle, best in city, doctor approved.
-8. Hindi-English code-mix ONLY if merchant language includes "hi". Pure English otherwise.
-9. Address the merchant owner by first name in the opening (provided as OWNER_NAME in context). Warm but brief — e.g. "Rahul, your CTR dropped..." not "Dear Rahul,".
+7. Max 4 sentences. WhatsApp-native. No markdown headers or bullets.
+8. Never hallucinate data. If a fact isn't in the context, don't say it.
+9. Taboo words (never use): guaranteed, 100% safe, completely cure, miracle, best in city, doctor approved.
+10. Hindi-English code-mix ONLY if merchant language includes "hi". Pure English otherwise.
+11. Address the merchant owner by first name in the opening (provided as OWNER_NAME). Warm but brief — "Rahul, your CTR dropped..." not "Dear Rahul,".
 
 Output ONLY valid JSON — no surrounding text:
 {
@@ -542,7 +544,7 @@ def handle_reply(conv_id: str, merchant_msg: str, merchant_id: str, customer_id:
     conv  = conversations.get(conv_id, {})
     turns = conv.get("turns", [])
 
-    # Count consecutive auto-replies from merchant
+    # Count consecutive auto-replies from the OTHER party (not vera) before this message
     auto_run = 0
     for t in reversed(turns):
         if t.get("from") != "vera":
@@ -553,27 +555,39 @@ def handle_reply(conv_id: str, merchant_msg: str, merchant_id: str, customer_id:
         else:
             break
 
-    cur_auto      = is_auto_reply(merchant_msg)
-    cur_auto_high = is_auto_reply_high(merchant_msg)
-    same_count    = sum(1 for t in turns if t.get("from") != "vera" and t.get("body") == merchant_msg)
+    cur_auto   = is_auto_reply(merchant_msg)
+    same_count = sum(1 for t in turns if t.get("from") != "vera" and t.get("body") == merchant_msg)
 
-    # Fast paths — ordered by priority
-
-    # High-confidence auto-reply (canned "Thank you for contacting" type) → end immediately
-    # same_count >= 2 only applies when the repeated message is also an auto-reply
-    if cur_auto_high or (same_count >= 2 and cur_auto):
-        return {"action": "end", "rationale": "High-confidence auto-reply detected; gracefully exiting."}
-
-    # Moderate auto-reply: on 2nd consecutive occurrence → end
-    if cur_auto and auto_run >= 2:
-        return {"action": "end", "rationale": "Auto-reply loop detected; gracefully exiting."}
-
-    # Clear rejection / hostility → end (judge accepts action: end for hostile/stop messages)
+    # REJECTION / STOP — hardcoded, no LLM, takes priority over everything
     if is_rejection(merchant_msg):
-        return {
-            "action": "end",
-            "rationale": "Merchant rejected or asked to stop; gracefully exiting.",
-        }
+        return {"action": "end", "rationale": "Merchant said STOP or rejected; gracefully exiting."}
+
+    # AUTO-REPLY SEQUENCE: nudge (1st) → wait 24h (2nd) → end (3rd+)
+    if cur_auto:
+        if same_count >= 2 or auto_run >= 2:
+            # 3rd occurrence or 3rd consecutive: definitely a bot, exit
+            return {"action": "end", "rationale": "Auto-reply loop confirmed (3rd detection); gracefully exiting."}
+        elif auto_run == 1:
+            # 2nd consecutive: back off for 24 hours
+            return {
+                "action": "wait",
+                "wait_seconds": 86400,
+                "rationale": "Second consecutive auto-reply; backing off 24h before retrying.",
+            }
+        else:
+            # 1st auto-reply: try once to reach real person
+            merchant_fp = get_ctx("merchant", merchant_id) or {}
+            lang_fp     = merchant_fp.get("identity", {}).get("languages", ["en"])
+            if "hi" in lang_fp:
+                nudge = "Kya aap ya owner yahaan se direct reply kar sakte hain? Ek quick sawaal hai aapke business ke baare mein."
+            else:
+                nudge = "Are you the owner? I have a quick question about your business — can you reply directly here?"
+            return {
+                "action": "send",
+                "body": nudge,
+                "cta": "open_ended",
+                "rationale": "First auto-reply detected; sending one nudge to reach real person.",
+            }
 
     # Acceptance fast path — switch to action immediately, no more qualifying
     if is_acceptance(merchant_msg):
@@ -604,20 +618,17 @@ def handle_reply(conv_id: str, merchant_msg: str, merchant_id: str, customer_id:
     identity  = merchant.get("identity", {})
     lang      = identity.get("languages", ["en"])
     lang_note = "Hindi-English mix" if "hi" in lang else "English only"
+    peer      = category.get("peer_stats", {})
 
     history_txt = "\n".join(f"  {t['from'].upper()}: {t['body']}" for t in turns[-6:])
 
-    state_hint = ""
-    if cur_auto:
-        state_hint = "CURRENT: first auto-reply detected. Respond with action=send, try ONCE to reach the real person (e.g. 'Kya aap direct reply kar sakte hain?'). Do NOT end yet."
-
     user_msg = f"""MERCHANT: {identity.get('name', '')} | Category: {cat_slug} | Language: {lang_note}
+Peer avg CTR: {peer.get('avg_ctr', '?')} | Peer avg reviews: {peer.get('avg_reviews', '?')}
 
 CONVERSATION HISTORY:
 {history_txt}
 
 MERCHANT'S LATEST (turn {turn_num}): "{merchant_msg}"
-{state_hint}
 
 Active offers: {', '.join(o['title'] for o in merchant.get('offers', []) if o.get('status') == 'active') or 'none'}
 Signals: {', '.join(merchant.get('signals', []))}
